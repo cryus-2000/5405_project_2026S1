@@ -169,7 +169,7 @@ Notebook outputs are intentionally cleared before GitHub upload.
 
 ## Report Figures
 
-`04_report_visualizations.ipynb` generates:
+`03_report_visualizations.ipynb` generates:
 
 - `paper_metrics_comparison.png`
 - `iou_delta_vs_baseline.png`
