@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environments
+.env
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Dataset and local experiment artifacts
+Charades/
+data/
+unique_data/
+outputs/
+docs/
+
+# Large model/data files
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.npy
+*.npz
+
+# Local reference documents
+*.pdf

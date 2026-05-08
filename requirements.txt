@@ -1,0 +1,11 @@
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+opencv-python>=4.8
+pillow>=10.0
+torch>=2.1
+transformers>=4.40
+sentencepiece>=0.1.99
+protobuf>=4.25
+jupyter>=1.0
+ipykernel>=6.29
