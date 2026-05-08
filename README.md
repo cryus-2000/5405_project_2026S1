@@ -159,10 +159,10 @@ Use notebooks in this order:
 1. `01_data_and_sampling_check.ipynb`  
    Check local paths, annotation loading, video availability, and sampled frames.
 
-2. `03_comparison_experiments.ipynb`  
+2. `02_comparison_experiments.ipynb`  
    Run small and full comparison experiments.
 
-3. `04_report_visualizations.ipynb`  
+3. `03_report_visualizations.ipynb`  
    Generate report-ready figures from saved metrics, predictions, and original videos.
 
 Notebook outputs are intentionally cleared before GitHub upload.
@@ -197,32 +197,3 @@ compare_l100_i3d_siglip2_minprop_auto
 | full | 0.49 | 0.26 | 0.4064 |
 
 These results are from a 100-query development run and are mainly used for report preparation.
-
-## Files Excluded From GitHub
-
-The repository should not include:
-
-- `Charades/`
-- `outputs/`
-- downloaded model weights
-- videos
-- cached features
-- prediction CSVs
-- report figures
-- PDFs and compressed archives
-
-The `.gitignore` file is configured for this.
-
-## Recommended GitHub Upload
-
-```powershell
-git init
-git add .gitignore README.md requirements.txt src notebooks
-git status --short
-git commit -m "Initial COMP5405 project implementation"
-git branch -M main
-git remote add origin <your-github-repo-url>
-git push -u origin main
-```
-
-Do not upload the whole folder through the GitHub web UI unless `Charades/`, `outputs/`, PDFs, videos, archives, and model checkpoints are manually excluded.
