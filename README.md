@@ -70,6 +70,24 @@ The Novel-location OOD-1 setting prepends 10 seconds from another Charades video
 
 No concatenated videos are written to disk; the OOD split is simulated during sampling and evaluation.
 
+## Methodology and Module Overview
+
+The pipeline works at snippet level. Each video is divided into 32 temporal snippets, and each snippet is represented by both vision-language alignment features and I3D action features.
+
+| Module | Purpose | Main file |
+|---|---|---|
+| Data loading | Reads Charades-STA annotations, video metadata, and local video paths. | `src/data_utils.py` |
+| Video sampling | Uniformly samples snippet frames from each video, including the shifted sampling used for OOD-1. | `src/retrieval.py` |
+| VLM alignment | Uses CLIP or SigLIP2 to encode query text and sampled frames, then produces a snippet-query score curve. | `src/model.py` |
+| I3D extraction | Produces one action-aware feature vector for each sampled snippet. These features support proposal generation rather than direct text matching. | `src/model.py`, `src/i3d.py` |
+| Baseline retrieval | Smooths the VLM score curve, selects the highest-scoring snippet, and expands the temporal boundary around it. | `src/retrieval.py` |
+| Query decomposition | Uses spaCy dependency parsing to split complex queries into verb-centered sub-queries, then fuses their score curves. | `src/query_utils.py` |
+| QC-FR | Refines I3D snippet features using query-score similarity and nearby temporal context. | `src/retrieval.py` |
+| BU-PG | Clusters I3D features with k-means, converts clusters into temporal proposals, and selects the proposal with the best query alignment. | `src/retrieval.py` |
+| Evaluation | Runs each method, writes prediction CSV files, and computes IoU-based metrics. | `src/eval.py`, `src/run_experiments.py` |
+
+In short, CLIP/SigLIP2 decides which snippets are semantically close to the query, I3D provides motion-aware snippet features, BU-PG turns snippet features into candidate temporal segments, and QC-FR tests whether query-aware feature refinement improves those proposals.
+
 ## Full-data Results
 
 The following metrics are from the full Charades-STA test split.
