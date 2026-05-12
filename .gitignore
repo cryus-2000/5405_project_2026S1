@@ -25,8 +25,11 @@ Thumbs.db
 Charades/
 data/
 unique_data/
-outputs/
 docs/
+
+# Keep generated report results, but ignore large/reproducible artifacts.
+outputs/cache/
+outputs/models/
 
 # Large model/data files
 *.pt
