@@ -2,7 +2,7 @@
 
 The code mirrors the report structure:
 1. sample video snippets;
-2. score snippet-query alignment with SigLIP2;
+2. score snippet-query alignment with a frozen CLIP/SigLIP-style encoder;
 3. optionally refine I3D features with QC-FR;
 4. optionally generate BU-PG proposals.
 """
@@ -29,8 +29,7 @@ SUPPORTED_METHODS = ["baseline", "query_decomp", "qc_fr", "bu_pg", "full"]
 PROPOSAL_METHODS = ["kmeans"]
 
 
-def sample_video_snippets(video_path, num_snippets=32, snippet_frames=16):
-    """Uniformly sample fixed-length snippets and return center timestamps."""
+def open_video_stream(video_path):
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -38,35 +37,80 @@ def sample_video_snippets(video_path, num_snippets=32, snippet_frames=16):
         cap.release()
         raise RuntimeError(f"Could not open a valid video stream from {video_path}")
     duration = frame_count / fps
+    return cap, fps, frame_count, duration
+
+
+def read_frame_at_time(cap, fps, frame_count, time):
+    frame_index = min(max(int(time * fps), 0), frame_count - 1)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    ok, frame = cap.read()
+    if not ok:
+        return None
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(frame)
+
+
+def sample_video_snippets(
+    video_path,
+    num_snippets=32,
+    snippet_frames=16,
+    prefix_video_path=None,
+    prefix_seconds=0.0,
+):
+    """Uniformly sample snippets and return center timestamps.
+
+    When `prefix_video_path` and `prefix_seconds` are provided, the sampler
+    behaves as if the first `prefix_seconds` seconds of a different video were
+    prepended before the target video. This supports Novel-location OOD
+    evaluation without writing temporary concatenated videos.
+    """
+    target_cap, target_fps, target_frame_count, target_duration = open_video_stream(video_path)
+    prefix_seconds = max(0.0, float(prefix_seconds or 0.0))
+    prefix_cap = None
+    prefix_fps = None
+    prefix_frame_count = None
+    prefix_duration = None
+    if prefix_seconds > 0:
+        if prefix_video_path is None:
+            target_cap.release()
+            raise ValueError("prefix_video_path is required when prefix_seconds > 0")
+        prefix_cap, prefix_fps, prefix_frame_count, prefix_duration = open_video_stream(prefix_video_path)
+
+    duration = target_duration + prefix_seconds
 
     snippets = []
     centers = []
-    for snippet_index in range(num_snippets):
-        # Each snippet covers an equal temporal bin. The model later treats the
-        # bin center as the snippet timestamp.
-        start = duration * snippet_index / num_snippets
-        end = duration * (snippet_index + 1) / num_snippets
-        step = (end - start) / max(snippet_frames, 1)
-        times = start + step * (np.arange(snippet_frames) + 0.5)
-        frames = []
-        for time in times:
-            frame_index = min(max(int(time * fps), 0), frame_count - 1)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame))
+    try:
+        for snippet_index in range(num_snippets):
+            # Each snippet covers an equal temporal bin. The model later treats
+            # the bin center as the snippet timestamp.
+            start = duration * snippet_index / num_snippets
+            end = duration * (snippet_index + 1) / num_snippets
+            step = (end - start) / max(snippet_frames, 1)
+            times = start + step * (np.arange(snippet_frames) + 0.5)
+            frames = []
+            for time in times:
+                if prefix_cap is not None and time < prefix_seconds:
+                    source_time = min(time, max(prefix_duration - EPS, 0.0))
+                    frame = read_frame_at_time(prefix_cap, prefix_fps, prefix_frame_count, source_time)
+                else:
+                    source_time = min(max(time - prefix_seconds, 0.0), max(target_duration - EPS, 0.0))
+                    frame = read_frame_at_time(target_cap, target_fps, target_frame_count, source_time)
+                if frame is not None:
+                    frames.append(frame)
 
-        if not frames and snippets:
-            frames = snippets[-1]
-        if not frames:
-            raise RuntimeError(f"Could not decode frames from {video_path}")
+            if not frames and snippets:
+                frames = snippets[-1]
+            if not frames:
+                raise RuntimeError(f"Could not decode frames from {video_path}")
 
-        snippets.append(frames)
-        centers.append(0.5 * (start + end))
+            snippets.append(frames)
+            centers.append(0.5 * (start + end))
+    finally:
+        target_cap.release()
+        if prefix_cap is not None:
+            prefix_cap.release()
 
-    cap.release()
     return np.asarray(centers), snippets, duration
 
 
@@ -97,7 +141,7 @@ def l2_normalize(values):
 
 
 def compute_score_matrix(alignment_features, text_features, smooth_kernel=1):
-    """Compute f^c(s, q): snippet-query similarity from frozen SigLIP2 features."""
+    """Compute f^c(s, q): snippet-query similarity from frozen alignment features."""
     alignment_features = l2_normalize(alignment_features)
     text_features = l2_normalize(text_features)
     if text_features.ndim == 1:
@@ -539,12 +583,16 @@ def encode_video(
     alignment_encoder,
     num_snippets=32,
     snippet_frames=16,
+    prefix_video_path=None,
+    prefix_seconds=0.0,
 ):
-    """Encode one video once into I3D visual features and SigLIP2 alignment features."""
+    """Encode one video once into I3D visual features and alignment features."""
     times, snippets, duration = sample_video_snippets(
         Path(video_path),
         num_snippets=num_snippets,
         snippet_frames=snippet_frames,
+        prefix_video_path=prefix_video_path,
+        prefix_seconds=prefix_seconds,
     )
     visual_features = visual_extractor.extract(snippets=snippets)
     alignment_features = alignment_encoder.encode_snippets(snippets)
@@ -583,7 +631,7 @@ def retrieve_query_decomp_from_features(
     alignment_encoder,
     smooth_kernel=5,
     threshold_ratio=0.75,
-    query_backend="rule",
+    query_backend="spacy",
 ):
     """Query-decomposition baseline without QC-FR or BU-PG."""
     parsed_query = parse_query(query, backend=query_backend)
@@ -679,7 +727,7 @@ def retrieve_bu_pg_from_features(
     video_features,
     query,
     alignment_encoder,
-    query_backend="rule",
+    query_backend="spacy",
     use_qc_fr=False,
     qc_lambda=DEFAULT_QC_LAMBDA,
     context_distance=DEFAULT_CONTEXT_DISTANCE,
@@ -757,7 +805,7 @@ def retrieve_moment_from_features(
     smooth_kernel=5,
     threshold_ratio=0.75,
     method="baseline",
-    query_backend="rule",
+    query_backend="spacy",
     qc_lambda=DEFAULT_QC_LAMBDA,
     context_distance=DEFAULT_CONTEXT_DISTANCE,
     proposal_k=DEFAULT_PROPOSAL_K,

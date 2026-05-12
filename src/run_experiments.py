@@ -6,11 +6,27 @@ import csv
 import json
 
 from eval import parse_limit, run_eval
-from model import DEFAULT_ALIGNMENT_MODEL, SigLIPEncoder, build_visual_feature_extractor, default_i3d_checkpoint
-from retrieval import PROPOSAL_METHODS, SUPPORTED_METHODS
+from model import (
+    DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE,
+    DEFAULT_ALIGNMENT_MODEL,
+    DEFAULT_I3D_BATCH_SIZE,
+    SigLIPEncoder,
+    build_visual_feature_extractor,
+    default_i3d_checkpoint,
+)
+from retrieval import PROPOSAL_METHODS
 
 
-DEFAULT_METHODS = SUPPORTED_METHODS
+DEFAULT_METHODS = ["baseline", "query_decomp", "bu_pg", "full"]
+
+
+def alignment_model_slug(model_name):
+    name = str(model_name).lower()
+    if "siglip2" in name:
+        return "siglip2"
+    if "clip" in name:
+        return "clip"
+    return Path(model_name).name.replace("-", "_").replace("/", "_")
 
 
 def write_metrics_csv(path, rows):
@@ -42,16 +58,19 @@ def run_comparison(
     smooth_kernel=5,
     threshold_ratio=0.75,
     alignment_model_name=DEFAULT_ALIGNMENT_MODEL,
+    alignment_image_batch_size=DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE,
     i3d_checkpoint=None,
     i3d_num_classes=400,
-    i3d_batch_size=4,
-    query_backend="rule",
+    i3d_batch_size=DEFAULT_I3D_BATCH_SIZE,
+    query_backend="spacy",
     qc_lambda=0.5,
     context_distance=2,
     proposal_k=6,
     proposal_method="kmeans",
     require_overlap=True,
     min_proposal_snippets=0,
+    novel_location_prefix_seconds=0.0,
+    novel_location_seed=0,
     experiment_name=None,
     use_feature_cache=True,
 ):
@@ -62,17 +81,19 @@ def run_comparison(
 
     methods = methods or DEFAULT_METHODS
     limit_label = "full" if limit is None else str(limit)
-    experiment_name = experiment_name or (
-        f"comparison_l{limit_label}_s{num_frames}_c{snippet_frames}_i3d"
-        f"_align_{Path(alignment_model_name).name}_qcl{qc_lambda}_ln{context_distance}"
-        f"_k{proposal_k}_{proposal_method}_minp{min_proposal_snippets}"
-    )
+    if experiment_name is None:
+        model_slug = alignment_model_slug(alignment_model_name)
+        suffix = f"_ood{int(novel_location_prefix_seconds)}s" if float(novel_location_prefix_seconds or 0) > 0 else ""
+        experiment_name = f"comparison_{model_slug}_l{limit_label}_s{num_frames}{suffix}"
 
     prediction_dir = project_root / "outputs" / "predictions" / experiment_name
     metrics_dir = project_root / "outputs" / "experiments"
     feature_cache_dir = project_root / "outputs" / "cache" / "video_features" if use_feature_cache else None
 
-    alignment_encoder = SigLIPEncoder(model_name=alignment_model_name)
+    alignment_encoder = SigLIPEncoder(
+        model_name=alignment_model_name,
+        image_batch_size=alignment_image_batch_size,
+    )
     visual_extractor = build_visual_feature_extractor(
         i3d_checkpoint=i3d_checkpoint,
         i3d_num_classes=i3d_num_classes,
@@ -95,6 +116,7 @@ def run_comparison(
             smooth_kernel=smooth_kernel,
             threshold_ratio=threshold_ratio,
             alignment_model_name=alignment_model_name,
+            alignment_image_batch_size=alignment_image_batch_size,
             i3d_checkpoint=i3d_checkpoint,
             i3d_num_classes=i3d_num_classes,
             i3d_batch_size=i3d_batch_size,
@@ -106,6 +128,8 @@ def run_comparison(
             proposal_method=proposal_method,
             require_overlap=require_overlap,
             min_proposal_snippets=min_proposal_snippets,
+            novel_location_prefix_seconds=novel_location_prefix_seconds,
+            novel_location_seed=novel_location_seed,
             alignment_encoder=alignment_encoder,
             visual_extractor=visual_extractor,
             video_cache=video_cache,
@@ -124,6 +148,7 @@ def run_comparison(
                 "i3d_num_classes": i3d_num_classes,
                 "i3d_batch_size": i3d_batch_size,
                 "alignment_model_name": alignment_model_name,
+                "alignment_image_batch_size": alignment_image_batch_size,
                 "query_backend": query_backend,
                 "qc_lambda": qc_lambda,
                 "context_distance": context_distance,
@@ -131,6 +156,8 @@ def run_comparison(
                 "proposal_method": proposal_method,
                 "min_proposal_snippets": min_proposal_snippets,
                 "require_overlap": require_overlap,
+                "novel_location_prefix_seconds": novel_location_prefix_seconds,
+                "novel_location_seed": novel_location_seed,
                 **metrics,
             }
         )
@@ -158,10 +185,11 @@ def parse_args():
     parser.add_argument("--smooth-kernel", type=int, default=5)
     parser.add_argument("--threshold-ratio", type=float, default=0.75)
     parser.add_argument("--alignment-model-name", default=DEFAULT_ALIGNMENT_MODEL)
+    parser.add_argument("--alignment-image-batch-size", type=int, default=DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE)
     parser.add_argument("--i3d-checkpoint", default=str(default_i3d_checkpoint(root)))
     parser.add_argument("--i3d-num-classes", type=int, default=400)
-    parser.add_argument("--i3d-batch-size", type=int, default=4)
-    parser.add_argument("--query-backend", choices=["rule", "auto"], default="rule")
+    parser.add_argument("--i3d-batch-size", type=int, default=DEFAULT_I3D_BATCH_SIZE)
+    parser.add_argument("--query-backend", choices=["spacy"], default="spacy")
     parser.add_argument("--qc-lambda", type=float, default=0.5)
     parser.add_argument("--context-distance", type=int, default=2)
     parser.add_argument("--proposal-k", type=int, default=6)
@@ -177,6 +205,18 @@ def parse_args():
         default="kmeans",
     )
     parser.add_argument("--allow-disjoint-combinations", action="store_true")
+    parser.add_argument(
+        "--novel-location-prefix-seconds",
+        type=float,
+        default=0.0,
+        help="Novel-location OOD prefix length. Use 10 or 15 for Charades-style OOD-1/OOD-2 runs.",
+    )
+    parser.add_argument(
+        "--novel-location-seed",
+        type=int,
+        default=0,
+        help="Deterministic seed for choosing prefix videos in novel-location OOD runs.",
+    )
     parser.add_argument("--experiment-name", default=None)
     parser.add_argument("--no-feature-cache", action="store_true")
     return parser.parse_args()
@@ -193,6 +233,7 @@ if __name__ == "__main__":
         smooth_kernel=args.smooth_kernel,
         threshold_ratio=args.threshold_ratio,
         alignment_model_name=args.alignment_model_name,
+        alignment_image_batch_size=args.alignment_image_batch_size,
         i3d_checkpoint=args.i3d_checkpoint,
         i3d_num_classes=args.i3d_num_classes,
         i3d_batch_size=args.i3d_batch_size,
@@ -203,6 +244,8 @@ if __name__ == "__main__":
         proposal_method=args.proposal_method,
         require_overlap=not args.allow_disjoint_combinations,
         min_proposal_snippets=args.min_proposal_snippets,
+        novel_location_prefix_seconds=args.novel_location_prefix_seconds,
+        novel_location_seed=args.novel_location_seed,
         experiment_name=args.experiment_name,
         use_feature_cache=not args.no_feature_cache,
     )

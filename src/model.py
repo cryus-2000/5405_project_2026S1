@@ -5,13 +5,29 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
 from i3d import InceptionI3D, clean_i3d_state_dict
 
 
 EPS = 1e-8
-DEFAULT_ALIGNMENT_MODEL = "google/siglip2-base-patch16-224"
+DEFAULT_ALIGNMENT_MODEL = "openai/clip-vit-base-patch32"
+DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE = 64
+DEFAULT_I3D_BATCH_SIZE = 8
+
+
+def configure_torch_performance():
+    """Enable faster CUDA kernels for inference-heavy experiment runs."""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 
 def default_i3d_checkpoint(project_root):
@@ -24,16 +40,23 @@ def l2_normalize_numpy(values):
     return values / np.maximum(norms, EPS)
 
 
-class SigLIPEncoder:
-    """Frozen SigLIP2 encoder used for snippet-query correlation."""
+class FrozenAlignmentEncoder:
+    """Frozen image-text encoder used for snippet-query correlation.
 
-    def __init__(self, model_name=DEFAULT_ALIGNMENT_MODEL, device=None, image_batch_size=32):
+    The wrapper intentionally relies on the common Hugging Face
+    `get_text_features` / `get_image_features` interface so the same retrieval
+    code can compare SigLIP2 and CLIP-style backbones.
+    """
+
+    def __init__(self, model_name=DEFAULT_ALIGNMENT_MODEL, device=None, image_batch_size=DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE):
+        configure_torch_performance()
         self.name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.image_batch_size = int(image_batch_size)
         self.processor = self._load_processor(model_name)
         self.model = self._load_model(model_name).to(self.device)
         self.model.eval()
+        print(f"Alignment encoder: {self.name} on {self.device} (image batch={self.image_batch_size})")
 
     def _load_processor(self, model_name):
         # Prefer the local Hugging Face cache so notebooks keep working offline
@@ -73,8 +96,9 @@ class SigLIPEncoder:
     def encode_text(self, texts):
         """Return one normalized text embedding per query/sub-query."""
         inputs = self.processor(
-            text=texts,
+            text=list(texts),
             padding="max_length",
+            truncation=True,
             return_tensors="pt",
         ).to(self.device)
         features = self._to_feature_tensor(self.model.get_text_features(**inputs))
@@ -97,7 +121,7 @@ class SigLIPEncoder:
         return np.concatenate(batches, axis=0) if batches else np.empty((0, 0), dtype=np.float32)
 
     def encode_snippets(self, snippets):
-        """Average SigLIP2 frame embeddings into one alignment feature per snippet."""
+        """Average frame embeddings into one alignment feature per snippet."""
         flat_frames = []
         snippet_lengths = []
         for frames in snippets:
@@ -117,7 +141,8 @@ class SigLIPEncoder:
 class I3DFeatureExtractor:
     """Real Inception-I3D feature extractor for snippet-level visual features."""
 
-    def __init__(self, checkpoint_path, num_classes=400, device=None, batch_size=4):
+    def __init__(self, checkpoint_path, num_classes=400, device=None, batch_size=DEFAULT_I3D_BATCH_SIZE):
+        configure_torch_performance()
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self.num_classes = int(num_classes)
         self.batch_size = int(batch_size)
@@ -134,6 +159,7 @@ class I3DFeatureExtractor:
         self._load_checkpoint(self.checkpoint_path)
         self.model.to(self.device)
         self.model.eval()
+        print(f"I3D extractor: {self.checkpoint_path} on {self.device} (batch={self.batch_size})")
 
     def _load_checkpoint(self, checkpoint_path):
         """Load checkpoints saved either as raw state_dict or wrapped dict."""
@@ -172,22 +198,25 @@ class I3DFeatureExtractor:
 
 def preprocess_i3d_clip(frames, size=224, min_frames=16):
     """Convert PIL frames to the RGB input format expected by the I3D checkpoint."""
+    if not frames:
+        raise ValueError("I3D preprocessing received an empty frame list.")
+
     if len(frames) < min_frames:
         frames = list(frames) + [frames[-1]] * (min_frames - len(frames))
 
     arrays = []
     for frame in frames:
+        frame = frame.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
         array = np.asarray(frame).astype(np.float32) / 127.5 - 1.0
         arrays.append(array)
     clip = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2)
-    clip = F.interpolate(clip, size=(size, size), mode="bilinear", align_corners=False)
     return clip.permute(1, 0, 2, 3).contiguous()
 
 
 def build_visual_feature_extractor(
     i3d_checkpoint,
     i3d_num_classes=400,
-    i3d_batch_size=4,
+    i3d_batch_size=DEFAULT_I3D_BATCH_SIZE,
     device=None,
 ):
     return I3DFeatureExtractor(
@@ -200,3 +229,7 @@ def build_visual_feature_extractor(
 
 def cosine_scores(image_features, text_feature):
     return np.asarray(image_features) @ np.asarray(text_feature)
+
+
+# Backward-compatible name used by the existing evaluation scripts.
+SigLIPEncoder = FrozenAlignmentEncoder

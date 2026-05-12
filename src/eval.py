@@ -8,7 +8,14 @@ import json
 import numpy as np
 
 from data_utils import load_sta_annotations, load_video_lengths, project_paths
-from model import DEFAULT_ALIGNMENT_MODEL, SigLIPEncoder, build_visual_feature_extractor, default_i3d_checkpoint
+from model import (
+    DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE,
+    DEFAULT_ALIGNMENT_MODEL,
+    DEFAULT_I3D_BATCH_SIZE,
+    SigLIPEncoder,
+    build_visual_feature_extractor,
+    default_i3d_checkpoint,
+)
 from retrieval import encode_video, retrieve_moment_from_features
 
 
@@ -17,6 +24,8 @@ PREDICTION_FIELDS = [
     "query",
     "gt_start",
     "gt_end",
+    "ood_prefix_seconds",
+    "ood_prefix_video_id",
     "pred_start",
     "pred_end",
     "iou",
@@ -52,6 +61,37 @@ def video_feature_cache_path(cache_dir, cache_key, video_path, num_snippets, sni
     model_key = safe_cache_name(cache_key)
     video_key = safe_cache_name(video_path)
     return Path(cache_dir) / model_key / f"{video_key}_s{num_snippets}_c{snippet_frames}.npz"
+
+
+def encoded_video_cache_key(video_path, prefix_video_path=None, prefix_seconds=0.0):
+    """Key one encoded video, including synthetic novel-location prefixes."""
+    prefix_seconds = float(prefix_seconds or 0.0)
+    if prefix_seconds <= 0:
+        return str(video_path)
+    return f"{video_path}|prefix={prefix_video_path}|prefix_seconds={prefix_seconds:.3f}"
+
+
+def prefix_video_candidates(video_dir, lengths, min_duration):
+    """Return deterministic candidate videos long enough for OOD prefixes."""
+    video_dir = Path(video_dir)
+    candidates = []
+    for video_id, duration in sorted(lengths.items()):
+        if float(duration) < float(min_duration):
+            continue
+        path = video_dir / f"{video_id}.mp4"
+        if path.exists():
+            candidates.append(path)
+    return candidates
+
+
+def choose_novel_location_prefix_video(sample, candidates, seed=0):
+    """Pick a stable random-looking prefix video for one target video."""
+    filtered = [path for path in candidates if path.stem != sample.video_id]
+    if not filtered:
+        raise RuntimeError("No valid prefix videos are available for novel-location OOD evaluation.")
+    key = f"{seed}|{sample.video_id}"
+    index = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:12], 16) % len(filtered)
+    return filtered[index]
 
 
 def load_video_feature_cache(path):
@@ -114,9 +154,19 @@ def write_predictions(path, rows):
         writer.writerows(rows)
 
 
-def feature_cache_metadata(sample, alignment_model_name, i3d_checkpoint, i3d_num_classes, i3d_batch_size, num_frames, snippet_frames):
+def feature_cache_metadata(
+    sample,
+    alignment_model_name,
+    i3d_checkpoint,
+    i3d_num_classes,
+    i3d_batch_size,
+    num_frames,
+    snippet_frames,
+    prefix_video_path=None,
+    prefix_seconds=0.0,
+):
     """Store enough context to know how a cached feature file was produced."""
-    return {
+    metadata = {
         "video_path": str(sample.video_path),
         "visual_backbone": "i3d",
         "i3d_checkpoint": str(i3d_checkpoint),
@@ -126,11 +176,34 @@ def feature_cache_metadata(sample, alignment_model_name, i3d_checkpoint, i3d_num
         "num_snippets": num_frames,
         "snippet_frames": snippet_frames,
     }
+    prefix_seconds = float(prefix_seconds or 0.0)
+    if prefix_seconds > 0:
+        metadata.update(
+            {
+                "novel_location_prefix_seconds": prefix_seconds,
+                "prefix_video_path": str(prefix_video_path),
+                "prefix_video_id": Path(prefix_video_path).stem if prefix_video_path else "",
+                "composite_duration": sample.duration + prefix_seconds,
+            }
+        )
+    return metadata
 
 
-def load_or_encode_video(sample, video_cache, cache_path, visual_extractor, alignment_encoder, num_frames, snippet_frames, metadata):
+def load_or_encode_video(
+    sample,
+    video_cache,
+    cache_path,
+    visual_extractor,
+    alignment_encoder,
+    num_frames,
+    snippet_frames,
+    metadata,
+    video_key=None,
+    prefix_video_path=None,
+    prefix_seconds=0.0,
+):
     """Reuse features across methods and persist them across runs when a cache path is provided."""
-    video_key = str(sample.video_path)
+    video_key = video_key or str(sample.video_path)
     if video_key in video_cache:
         return video_cache[video_key]
 
@@ -145,6 +218,8 @@ def load_or_encode_video(sample, video_cache, cache_path, visual_extractor, alig
         alignment_encoder=alignment_encoder,
         num_snippets=num_frames,
         snippet_frames=snippet_frames,
+        prefix_video_path=prefix_video_path,
+        prefix_seconds=prefix_seconds,
     )
     video_cache[video_key] = video_features
     if cache_path is not None:
@@ -152,13 +227,26 @@ def load_or_encode_video(sample, video_cache, cache_path, visual_extractor, alig
     return video_features
 
 
-def prediction_row(sample, result, iou, method):
+def prediction_row(
+    sample,
+    result,
+    iou,
+    method,
+    gt_start=None,
+    gt_end=None,
+    ood_prefix_seconds=0.0,
+    ood_prefix_video_id="",
+):
     """Flatten one retrieval result into a CSV-friendly row."""
+    gt_start = sample.start if gt_start is None else gt_start
+    gt_end = sample.end if gt_end is None else gt_end
     return {
         "video_id": sample.video_id,
         "query": sample.query,
-        "gt_start": sample.start,
-        "gt_end": sample.end,
+        "gt_start": gt_start,
+        "gt_end": gt_end,
+        "ood_prefix_seconds": ood_prefix_seconds,
+        "ood_prefix_video_id": ood_prefix_video_id,
         "pred_start": result["pred_start"],
         "pred_end": result["pred_end"],
         "iou": iou,
@@ -190,17 +278,20 @@ def run_eval(
     smooth_kernel=5,
     threshold_ratio=0.75,
     alignment_model_name=DEFAULT_ALIGNMENT_MODEL,
+    alignment_image_batch_size=DEFAULT_ALIGNMENT_IMAGE_BATCH_SIZE,
     i3d_checkpoint=None,
     i3d_num_classes=400,
-    i3d_batch_size=4,
+    i3d_batch_size=DEFAULT_I3D_BATCH_SIZE,
     method="baseline",
-    query_backend="rule",
+    query_backend="spacy",
     qc_lambda=0.5,
     context_distance=2,
     proposal_k=6,
     proposal_method="kmeans",
     require_overlap=True,
     min_proposal_snippets=0,
+    novel_location_prefix_seconds=0.0,
+    novel_location_seed=0,
     alignment_encoder=None,
     visual_extractor=None,
     video_cache=None,
@@ -214,9 +305,20 @@ def run_eval(
 
     lengths = load_video_lengths(paths["test_csv"])
     samples = load_sta_annotations(paths["sta_test"], paths["video_dir"], lengths, limit=limit)
+    novel_location_prefix_seconds = max(0.0, float(novel_location_prefix_seconds or 0.0))
+    prefix_candidates = []
+    if novel_location_prefix_seconds > 0:
+        prefix_candidates = prefix_video_candidates(
+            video_dir=paths["video_dir"],
+            lengths=lengths,
+            min_duration=novel_location_prefix_seconds,
+        )
 
     if alignment_encoder is None:
-        alignment_encoder = SigLIPEncoder(model_name=alignment_model_name)
+        alignment_encoder = SigLIPEncoder(
+            model_name=alignment_model_name,
+            image_batch_size=alignment_image_batch_size,
+        )
     if visual_extractor is None:
         visual_extractor = build_visual_feature_extractor(
             i3d_checkpoint=i3d_checkpoint,
@@ -232,6 +334,21 @@ def run_eval(
     ious = []
 
     for index, sample in enumerate(samples, start=1):
+        prefix_video_path = None
+        prefix_video_id = ""
+        if novel_location_prefix_seconds > 0:
+            prefix_video_path = choose_novel_location_prefix_video(
+                sample=sample,
+                candidates=prefix_candidates,
+                seed=novel_location_seed,
+            )
+            prefix_video_id = Path(prefix_video_path).stem
+        video_key = encoded_video_cache_key(
+            sample.video_path,
+            prefix_video_path=prefix_video_path,
+            prefix_seconds=novel_location_prefix_seconds,
+        )
+
         # Video encoding is the expensive part. Cache it in memory across
         # methods and optionally on disk across script runs.
         cache_path = None
@@ -239,7 +356,7 @@ def run_eval(
             cache_path = video_feature_cache_path(
                 cache_dir=feature_cache_dir,
                 cache_key=feature_cache_key,
-                video_path=sample.video_path,
+                video_path=video_key,
                 num_snippets=num_frames,
                 snippet_frames=snippet_frames,
             )
@@ -260,7 +377,12 @@ def run_eval(
                 i3d_batch_size=i3d_batch_size,
                 num_frames=num_frames,
                 snippet_frames=snippet_frames,
+                prefix_video_path=prefix_video_path,
+                prefix_seconds=novel_location_prefix_seconds,
             ),
+            video_key=video_key,
+            prefix_video_path=prefix_video_path,
+            prefix_seconds=novel_location_prefix_seconds,
         )
 
         result = retrieve_moment_from_features(
@@ -278,14 +400,27 @@ def run_eval(
             require_overlap=require_overlap,
             min_proposal_snippets=min_proposal_snippets,
         )
+        gt_start = sample.start + novel_location_prefix_seconds
+        gt_end = sample.end + novel_location_prefix_seconds
         iou = temporal_iou(
             result["pred_start"],
             result["pred_end"],
-            sample.start,
-            sample.end,
+            gt_start,
+            gt_end,
         )
         ious.append(iou)
-        rows.append(prediction_row(sample, result, iou, method))
+        rows.append(
+            prediction_row(
+                sample=sample,
+                result=result,
+                iou=iou,
+                method=method,
+                gt_start=gt_start,
+                gt_end=gt_end,
+                ood_prefix_seconds=novel_location_prefix_seconds,
+                ood_prefix_video_id=prefix_video_id,
+            )
+        )
 
         if index % 50 == 0:
             print(f"Processed {index}/{len(samples)}")
@@ -307,4 +442,3 @@ def parse_limit(value):
     if value in {"none", "full", "all"}:
         return None
     return int(value)
-
